@@ -1,0 +1,200 @@
+"""
+Strong Lichess bot example wired for high strength (Stockfish + Syzygy + opening book).
+Requires: python-chess, requests, stockfish binary, syzygy tablebases, polyglot book (optional).
+Install:
+    pip install python-chess requests
+"""
+
+import requests
+import json
+import chess
+import chess.engine
+import chess.polyglot
+import os
+import time
+from pathlib import Path
+
+# ---------- Configuration ----------
+API_TOKEN = "your_lichess_api_token_here"
+STOCKFISH_PATH = "/usr/bin/stockfish"               # path to stockfish 15/16 binary
+POLYGLOT_BOOK = "book.bin"                          # optional polyglot book file
+SYZYGY_PATH = "/path/to/syzygy"                     # syzygy tablebase directory
+THREADS = 12
+HASH_MB = 32768                                     # e.g. 32768 = 32 GB
+MIN_TIME_MS = 30
+MAX_TIME_MS = 20000
+TIME_ALLOCATION_FACTOR = 20                         # remaining_time / factor
+USE_OPENING_BOOK = True
+AUTO_ACCEPT_CHALLENGES = True
+# -----------------------------------
+
+HEADERS = {
+    "Authorization": f"Bearer {API_TOKEN}",
+    "Accept": "application/x-ndjson"
+}
+BASE_URL = "https://lichess.org/api"
+
+def set_engine_options(engine):
+    # Set UCI options if available (names may vary by build)
+    try:
+        engine.configure({"Threads": THREADS})
+    except Exception:
+        pass
+    try:
+        engine.configure({"Hash": HASH_MB})
+    except Exception:
+        pass
+    # Syzygy path and probe if supported
+    try:
+        engine.configure({"SyzygyPath": SYZYGY_PATH})
+    except Exception:
+        pass
+    # Ponder on if available
+    try:
+        engine.configure({"Ponder": True})
+    except Exception:
+        pass
+
+def choose_book_move(board):
+    if not USE_OPENING_BOOK or not os.path.exists(POLYGLOT_BOOK):
+        return None
+    try:
+        with chess.polyglot.open_reader(POLYGLOT_BOOK) as book:
+            entries = list(book.find_all(board))
+            if not entries:
+                return None
+            # Weighted by weight or choose top entry
+            entry = max(entries, key=lambda e: e.weight)
+            return entry.move
+    except Exception:
+        return None
+
+def compute_time_limit_ms(remaining_ms, increment_ms):
+    # Conservative allocation but allow deep thinking if time is abundant
+    if remaining_ms <= 0:
+        return MIN_TIME_MS
+    # use increment to decide if we can spend more
+    base = max(MIN_TIME_MS, remaining_ms // TIME_ALLOCATION_FACTOR)
+    # if increment is large, allow more
+    if increment_ms >= 1000:
+        base = min(MAX_TIME_MS, base + increment_ms // 2)
+    return int(min(MAX_TIME_MS, max(MIN_TIME_MS, base)))
+
+class StrongLichessBot:
+    def __init__(self, api_token):
+        self.api_token = api_token
+        self.headers = HEADERS
+        self.engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+        set_engine_options(self.engine)
+
+    def stream_events(self):
+        r = requests.get(f"{BASE_URL}/stream/event", headers=self.headers, stream=True, timeout=60)
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if line:
+                yield json.loads(line)
+
+    def accept_challenge(self, challenge_id):
+        return requests.post(f"{BASE_URL}/challenge/{challenge_id}/accept", headers=self.headers).ok
+
+    def decline_challenge(self, challenge_id):
+        return requests.post(f"{BASE_URL}/challenge/{challenge_id}/decline", headers=self.headers, data={"reason":"generic"}).ok
+
+    def stream_game(self, game_id):
+        r = requests.get(f"{BASE_URL}/stream/game/{game_id}", headers=self.headers, stream=True, timeout=60)
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if line:
+                yield json.loads(line)
+
+    def play_move(self, game_id, move_uci):
+        return requests.post(f"{BASE_URL}/bot/game/{game_id}/move/{move_uci}", headers=self.headers).ok
+
+    def handle_challenge(self, challenge):
+        cid = challenge["challenge"]["id"]
+        perf = challenge["challenge"]["perf"]
+        # Optionally filter by variant/perf/rating here
+        if AUTO_ACCEPT_CHALLENGES:
+            self.accept_challenge(cid)
+
+    def play_game(self, game_id):
+        board = chess.Board()
+        # Track whether we are white
+        color_is_white = None
+        try:
+            for event in self.stream_game(game_id):
+                t = event.get("type")
+                if t == "gameFull":
+                    # initial full state
+                    state = event
+                    # determine color
+                    white_name = state["white"]["id"]
+                    # bot name is in account endpoint usually; but we can deduce from perspective later
+                if t == "gameState":
+                    # update board from moves string
+                    moves = event.get("moves", "")
+                    board = chess.Board()
+                    if moves:
+                        for u in moves.split():
+                            board.push_uci(u)
+                    # Find whose turn it is
+                    # Lichess gameState doesn't give explicit color of our bot here, so we'll rely on the board.turn.
+                    # Use wtime/btime to compute time limit
+                    wtime = event.get("wtime")
+                    btime = event.get("btime")
+                    winc = event.get("winc", 0)
+                    binc = event.get("binc", 0)
+                    # Determine remaining ms for side to move
+                    remaining_ms = wtime if board.turn == chess.WHITE else btime
+                    increment_ms = winc if board.turn == chess.WHITE else binc
+                    # If it's our turn (we are the side to move and are the bot) — we assume bot is playing via Lichess bot API so engine should move when side equals the bot's color.
+                    # Use opening book first
+                    if board.turn == chess.WHITE or board.turn == chess.BLACK:
+                        # Choose a book move if possible
+                        book_move = choose_book_move(board)
+                        if book_move:
+                            self.play_move(game_id, book_move.uci())
+                            continue
+                        # Probe Syzygy: python-chess has syzygy probe if set in environment
+                        tb_move = None
+                        try:
+                            # try tablebase probing for exact win/loss moves
+                            with chess.syzygy.open_tablebase(SYZYGY_PATH) as tb:
+                                tb_move = tb.probing_move(board)
+                        except Exception:
+                            tb_move = None
+                        if tb_move:
+                            self.play_move(game_id, tb_move.uci())
+                            continue
+                        # compute allocated time for search
+                        time_limit_ms = compute_time_limit_ms(remaining_ms or 0, increment_ms or 0)
+                        # For serious strength, prefer node limit or long time if available
+                        # We'll use a combination: allow at most time_limit_ms, but also set a high nodes cap sometimes.
+                        # Nodes example: allocate 5M nodes for longer time controls (if time allows)
+                        nodes_cap = 2000000
+                        if remaining_ms and remaining_ms > 2_000_00:  # lots of time left ( > 200s approx)
+                            nodes_cap = 10_000_000
+                        # Ask engine for best move with strong limits
+                        limit = chess.engine.Limit(time=time_limit_ms / 1000.0, nodes=nodes_cap)
+                        result = self.engine.play(board, limit, info=chess.engine.INFO_ALL)
+                        if result and result.move:
+                            self.play_move(game_id, result.move.uci())
+        except Exception as e:
+            print("Game error:", e)
+
+    def run(self):
+        for ev in self.stream_events():
+            t = ev.get("type")
+            if t == "challenge":
+                self.handle_challenge(ev)
+            elif t == "gameStart":
+                gid = ev["game"]["id"]
+                # gameStart event provides game id
+                self.play_game(gid)
+
+if __name__ == "__main__":
+    bot = StrongLichessBot(API_TOKEN)
+    try:
+        bot.run()
+    finally:
+        bot.engine.quit()
